@@ -1,0 +1,6 @@
+inters_per_km2,amenity_entropy,dest_access,transit_density_per_km2,sidewalk_ratio,crosswalks_per_km2,label
+140,0.82,0.66,25,0.78,9.5,0.92
+60,0.35,0.22,5,0.2,2.0,0.2
+95,0.55,0.4,12,0.5,5.0,0.55
+30,0.2,0.1,1,0.05,0.5,0.05
+170,0.88,0.75,40,0.9,12.0,0.98

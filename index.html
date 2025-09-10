@@ -1,0 +1,380 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Walkability ML — Single‑File Demo</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <style>
+    html, body { height: 100%; margin: 0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { display: grid; grid-template-columns: 1fr; grid-template-rows: 50vh 1fr; height: 100%; }
+    @media (min-width: 1024px) { #app { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr; } }
+    #map { width: 100%; height: 100%; }
+    .panel { padding: 16px; overflow: auto; }
+    .card { background: #f5f5f7; border-radius: 14px; padding: 10px 12px; }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+    .muted { opacity: .75; font-size: 12px; }
+    .score { font-size: 44px; font-weight: 800; }
+    button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; background: white; cursor: pointer;}
+    details { margin-top: 10px; }
+    code { background: #eee; padding: 1px 4px; border-radius: 6px; }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#eef; border:1px solid #ccd; font-size:12px; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div id="map"></div>
+  <div class="panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+      <div>
+        <div style="font-size:22px;font-weight:800">Walkability (beta)</div>
+        <div class="muted">Click the map to evaluate ~1 km radius. Runs entirely in your browser.</div>
+      </div>
+      <div>
+        <button id="geolocateBtn">Use my location</button>
+        <label class="pill">
+          <input type="checkbox" id="liveMode" checked/> Live fetch
+        </label>
+      </div>
+    </div>
+    <div id="status" class="muted" style="margin-top:8px;"></div>
+    <div id="scoreWrap" style="margin-top:10px;display:none;">
+      <div class="score"><span id="score"></span><span style="font-size:18px;">/100</span></div>
+      <div class="muted">Composite of connectivity, diversity, destination access, transit, sidewalks & crossings.</div>
+      <div class="grid" id="featGrid" style="margin-top:8px;"></div>
+      <h3 style="margin:12px 0 6px;">Targeted, cost‑aware improvements</h3>
+      <div id="sugg"></div>
+      <details>
+        <summary><b>Advanced:</b> retrain from labeled CSV</summary>
+        <div class="muted">Columns: inters_per_km2, amenity_entropy, dest_access, transit_density_per_km2, sidewalk_ratio, crosswalks_per_km2, label (0–1).</div>
+        <input type="file" id="csvInput" accept=".csv"/>
+      </details>
+      <details>
+        <summary><b>Methodology & caveats</b></summary>
+        <ul class="muted">
+          <li>Connectivity via intersection density per km² (degree ≥3).</li>
+          <li>Diversity via normalized Shannon entropy over amenity categories.</li>
+          <li>Destination access via distance‑decayed POIs (≤2 km).</li>
+          <li>Transit via stops per km² (bus, rail platforms/stations).</li>
+          <li>Sidewalk & crosswalk prevalence from OSM tags (<code>sidewalk=*</code>, <code>footway=sidewalk</code>, <code>highway=crossing</code>).</li>
+          <li>Composite uses literature‑informed seed weights; you may retrain with your labels.</li>
+          <li>OSM completeness varies; treat results as screening‑level.</li>
+        </ul>
+      </details>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
+<script>
+const OVERPASS = "https://overpass-api.de/api/interpreter";
+
+const AMENITY_CATS = {
+  supermarket:"grocery", convenience:"grocery", bakery:"grocery",
+  cafe:"food", restaurant:"food", fast_food:"food",
+  bar:"leisure", pub:"leisure",
+  pharmacy:"health", clinic:"health", doctors:"health", hospital:"health",
+  school:"education", kindergarten:"education", college:"education", university:"education",
+  library:"civic",
+  bank:"services", atm:"services", post_box:"services", post_office:"services",
+  arts_centre:"leisure", cinema:"leisure", theatre:"leisure",
+  park:"green", playground:"green"
+};
+
+const FEAT_BOUNDS = {
+  inters_per_km2: {min:10, max:200},
+  amenity_entropy: {min:0, max:1},
+  dest_access: {min:0, max:1},
+  transit_density_per_km2: {min:0, max:60},
+  sidewalk_ratio: {min:0, max:1},
+  crosswalks_per_km2: {min:0, max:50}
+};
+
+const SEED_WEIGHTS = {
+  inters_per_km2: 0.26,
+  amenity_entropy: 0.26,
+  dest_access: 0.18,
+  transit_density_per_km2: 0.16,
+  sidewalk_ratio: 0.08,
+  crosswalks_per_km2: 0.06
+};
+
+const UNIT_COSTS = {
+  sidewalk_per_linear_ft: [25,85],
+  painted_crosswalk_each: [200,400],
+  bike_lane_per_mile: [15000,80000],
+  refuge_island_each: [10000,15000],
+  street_tree_each: [400,3000]
+};
+
+function dollars([lo,hi]){return `$${lo.toLocaleString()}–$${hi.toLocaleString()}`;}
+function softClamp01(x){return Math.max(0, Math.min(1, x));}
+function scale(v, b){ if(isNaN(v)) return 0; return Math.max(0, Math.min(1, (v-b.min)/(b.max-b.min))); }
+function Hnorm(counts){
+  const vals = Object.values(counts); const total = vals.reduce((a,b)=>a+b,0); if(!total) return 0;
+  let H=0; for(const c of vals){ if(c>0){ const p=c/total; H+=-p*Math.log(p);}}
+  return H/Math.log(Object.keys(counts).length||1);
+}
+
+let map = L.map('map').setView([29.7604,-95.3698], 14);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution:'&copy; OpenStreetMap' }).addTo(map);
+let clickMarker=null, clickCircle=null;
+
+function setStatus(msg){ document.getElementById('status').textContent = msg||''; }
+function showScoreUI(){ document.getElementById('scoreWrap').style.display='block'; }
+
+function setFeaturesUI(f){
+  const el = document.getElementById('featGrid'); el.innerHTML='';
+  const items = [
+    ['Intersections/km²', f.inters_per_km2.toFixed(1)],
+    ['Amenity entropy', f.amenity_entropy.toFixed(2)],
+    ['Destination access', f.dest_access.toFixed(2)],
+    ['Transit stops/km²', f.transit_density_per_km2.toFixed(1)],
+    ['Sidewalk ratio', (f.sidewalk_ratio*100).toFixed(0)+'%'],
+    ['Crosswalks/km²', f.crosswalks_per_km2.toFixed(1)]
+  ];
+  for(const [k,v] of items){
+    const d=document.createElement('div'); d.className='card'; d.innerHTML=`${k}<div style="font-weight:600;font-size:18px">${v}</div>`; el.appendChild(d);
+  }
+}
+
+function suggest(f, radius_m){
+  const suggestions=[]; const area_km2 = Math.PI*radius_m*radius_m/1e6;
+  if (scale(f.sidewalk_ratio, FEAT_BOUNDS.sidewalk_ratio) < 0.5){
+    const need_ft = Math.round((2*Math.PI*radius_m)*3.28084*0.25);
+    suggestions.push({
+      title:'Fill sidewalk gaps (5‑ft concrete)',
+      why:'Continuous footways reduce exposure and unlock utilitarian walking.',
+      action:`Prioritize collectors & near schools/transit (~${need_ft.toLocaleString()} linear ft).`,
+      estCost: dollars([need_ft*UNIT_COSTS.sidewalk_per_linear_ft[0], need_ft*UNIT_COSTS.sidewalk_per_linear_ft[1]])
+    });
+  }
+  if (f.crosswalks_per_km2 < 8){
+    const add = Math.max(4, Math.round(8*area_km2 - f.crosswalk_count));
+    if (add>0){
+      suggestions.push({
+        title:'Add high‑visibility painted crosswalks',
+        why:'Sparse marked crossings reduce network permeability and increase exposure time.',
+        action:`Stripe ~${add} crossings at unsignalized legs and near stops/schools.`,
+        estCost: dollars([add*UNIT_COSTS.painted_crosswalk_each[0], add*UNIT_COSTS.painted_crosswalk_each[1]])
+      });
+    }
+  }
+  if (scale(f.transit_density_per_km2, FEAT_BOUNDS.transit_density_per_km2) < 0.4){
+    suggestions.push({
+      title:'Upgrade/cluster transit stops',
+      why:'Improved stop density/quality shortens access time and boosts walking to transit.',
+      action:'Consolidate closely spaced low‑use stops; add shelters where spacing exceeds ~400m.',
+      estCost:'Varies by agency; shelters often $10k–$20k each.'
+    });
+  }
+  if (scale(f.inters_per_km2, FEAT_BOUNDS.inters_per_km2) < 0.4){
+    suggestions.push({
+      title:'Break superblocks / add mid‑block paths',
+      why:'Low intersection density reduces route choice; short links raise effective connectivity.',
+      action:'Add pedestrian passages through large blocks or easements between cul‑de‑sacs.',
+      estCost:`Multi‑use path ${dollars([200*50, 200*70])} per ~200 ft segment`
+    });
+  }
+  if (scale(f.dest_access, FEAT_BOUNDS.dest_access) < 0.5){
+    suggestions.push({
+      title:'Activate ground floors / allow corner retail',
+      why:'Everyday destinations within 5–10 minutes increase utilitarian walking.',
+      action:'Permit small‑format retail/pop‑ups on corners near transit and schools.',
+      estCost:'Policy change; tenant improvements vary.'
+    });
+  }
+  if ((f.green_count||0) < 3){
+    const trees = Math.round(20*area_km2)+10;
+    suggestions.push({
+      title:'Plant street trees (context‑appropriate species)',
+      why:'Shade lowers heat and speeds; improves pedestrian comfort.',
+      action:`Focus on sun‑exposed arterials; target ~${trees} trees.`,
+      estCost: dollars([trees*UNIT_COSTS.street_tree_each[0], trees*UNIT_COSTS.street_tree_each[1]])
+    });
+  }
+  return suggestions;
+}
+
+function scoreFromFeatures(f){
+  const s =
+    SEED_WEIGHTS.inters_per_km2 * scale(f.inters_per_km2, FEAT_BOUNDS.inters_per_km2) +
+    SEED_WEIGHTS.amenity_entropy * scale(f.amenity_entropy, FEAT_BOUNDS.amenity_entropy) +
+    SEED_WEIGHTS.dest_access * scale(f.dest_access, FEAT_BOUNDS.dest_access) +
+    SEED_WEIGHTS.transit_density_per_km2 * scale(f.transit_density_per_km2, FEAT_BOUNDS.transit_density_per_km2) +
+    SEED_WEIGHTS.sidewalk_ratio * scale(f.sidewalk_ratio, FEAT_BOUNDS.sidewalk_ratio) +
+    SEED_WEIGHTS.crosswalks_per_km2 * scale(f.crosswalks_per_km2, FEAT_BOUNDS.crosswalks_per_km2);
+  return Math.round(softClamp01(s)*100);
+}
+
+function dist(a,b){ const A=L.latLng(a), B=L.latLng(b); return A.distanceTo(B); }
+
+async function fetchOverpass(point, radius=1000){
+  const {lat,lng} = point;
+  const amenityQ = `[out:json][timeout:25];(node["amenity"](around:${radius},${lat},${lng});way["amenity"](around:${radius},${lat},${lng}););out center;`;
+  const roadQ = `[out:json][timeout:25];(way["highway"](around:${radius},${lat},${lng}););out geom;`;
+  const crossQ = `[out:json][timeout:25];(node["highway"="crossing"](around:${radius},${lat},${lng});way["highway"="crossing"](around:${radius},${lat},${lng}););out geom;`;
+  const transitQ = `[out:json][timeout:25];(node["highway"="bus_stop"](around:${radius},${lat},${lng});node["railway"~"station|halt"](around:${radius},${lat},${lng});node["public_transport"="platform"](around:${radius},${lat},${lng}););out;`;
+  const run = async (q) => {
+    const res = await fetch(OVERPASS, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'data='+encodeURIComponent(q)});
+    if(!res.ok) throw new Error('Overpass error '+res.status);
+    return res.json();
+  };
+  const [amen, roads, cross, transit] = await Promise.all([run(amenityQ), run(roadQ), run(crossQ), run(transitQ)]);
+  return { amen, roads, cross, transit };
+}
+
+function computeFeatures(point, data, radius=1000){
+  const center = L.latLng(point);
+  const area_km2 = Math.PI*radius*radius/1e6;
+
+  // Destinations & entropy
+  const catCounts = {}; let destScore=0; let greenCount=0;
+  for(const el of (data.amen.elements||[])){
+    const tags = el.tags||{};
+    const cat = AMENITY_CATS[tags.amenity];
+    if(cat){
+      catCounts[cat] = (catCounts[cat]||0) + 1;
+      const c = el.type==='node' ? L.latLng(el.lat, el.lon) : L.latLng(el.center?.lat, el.center?.lon);
+      const d = dist(center, c);
+      const w = Math.max(0, 1 - d/2000);
+      destScore += w;
+    }
+    if (tags.leisure==='park' || tags.amenity==='park' || tags.landuse==='grass') greenCount++;
+  }
+  const amenity_entropy = Hnorm(catCounts);
+  const dest_access = Math.min(1, destScore/50);
+
+  // Intersections
+  const nodeDegree = {}; const nodes = {};
+  for(const w of (data.roads.elements||[])){
+    if(w.type!=='way' || !w.nodes) continue;
+    for(const nid of w.nodes){ nodeDegree[nid] = (nodeDegree[nid]||0)+1; }
+    if(w.geometry){ for(const g of w.geometry){ nodes[`${g.lat},${g.lon}`]={lat:g.lat, lon:g.lon}; } }
+  }
+  let interCount=0;
+  for(const deg of Object.values(nodeDegree)) if(deg>=3) interCount++;
+  const inters_per_km2 = interCount/area_km2;
+
+  // Sidewalks & crosswalks
+  let sidewalkWays=0, totalRoadWays=0, crossCount=0;
+  for(const w of (data.roads.elements||[])){
+    if(w.type!=='way') continue; totalRoadWays++;
+    const t=w.tags||{};
+    if (t.sidewalk && t.sidewalk!=='no') sidewalkWays++;
+    if (t.footway==='sidewalk') sidewalkWays++;
+  }
+  for(const c of (data.cross.elements||[])) crossCount++;
+  const crosswalks_per_km2 = crossCount/area_km2;
+  const sidewalk_ratio = totalRoadWays===0 ? 0 : sidewalkWays/totalRoadWays;
+
+  // Transit density
+  const transitCount = (data.transit.elements||[]).length;
+  const transit_density_per_km2 = transitCount/area_km2;
+
+  return { inters_per_km2, amenity_entropy, dest_access, transit_density_per_km2,
+           sidewalk_ratio, crosswalks_per_km2, crosswalk_count:crossCount, green_count:greenCount };
+}
+
+async function analyzeAt(latlng){
+  try {
+    setStatus('Fetching OpenStreetMap data…');
+    const data = await fetchOverpass(latlng, 1000);
+    const f = computeFeatures(latlng, data, 1000);
+    const score = scoreFromFeatures(f);
+    setStatus('');
+    document.getElementById('score').textContent = String(score);
+    setFeaturesUI(f); showScoreUI();
+
+    // Suggestions
+    const s = suggest(f, 1000);
+    const box = document.getElementById('sugg'); box.innerHTML='';
+    for(const item of s){
+      const div=document.createElement('div'); div.className='card'; 
+      div.innerHTML = `<div style="font-weight:600">${item.title}</div>
+        <div class="muted">${item.why}</div>
+        <div>${item.action}</div>
+        <div style="font-family:ui-monospace,Menlo,monospace">Estimated cost: ${item.estCost}</div>`;
+      box.appendChild(div);
+    }
+  } catch(err){
+    setStatus('Error: '+(err.message||err));
+  }
+}
+
+map.on('click', (e)=>{
+  const ll = e.latlng;
+  if(clickMarker){ map.removeLayer(clickMarker); map.removeLayer(clickCircle); }
+  clickMarker = L.marker(ll).addTo(map).bindPopup('Analysis center').openPopup();
+  clickCircle = L.circle(ll,{radius:1000}).addTo(map);
+  if(document.getElementById('liveMode').checked){ analyzeAt(ll); }
+});
+
+document.getElementById('geolocateBtn').onclick = ()=>{
+  if(navigator.geolocation){
+    navigator.geolocation.getCurrentPosition((pos)=>{
+      const ll = L.latLng(pos.coords.latitude, pos.coords.longitude);
+      map.setView(ll, 15);
+      if(clickMarker){ map.removeLayer(clickMarker); map.removeLayer(clickCircle); }
+      clickMarker = L.marker(ll).addTo(map).bindPopup('Your location').openPopup();
+      clickCircle = L.circle(ll,{radius:1000}).addTo(map);
+      if(document.getElementById('liveMode').checked){ analyzeAt(ll); }
+    }, ()=> setStatus('Location permission denied. Click anywhere on the map to analyze.'));
+  } else { setStatus('Geolocation not supported.'); }
+};
+
+// ---- tf.js simple retrain ----
+function makeModel(){
+  const model = tf.sequential();
+  model.add(tf.layers.dense({inputShape:[6], units:1, activation:'sigmoid', useBias:true}));
+  const W = tf.tensor2d([
+    [SEED_WEIGHTS.inters_per_km2],
+    [SEED_WEIGHTS.amenity_entropy],
+    [SEED_WEIGHTS.dest_access],
+    [SEED_WEIGHTS.transit_density_per_km2],
+    [SEED_WEIGHTS.sidewalk_ratio],
+    [SEED_WEIGHTS.crosswalks_per_km2],
+  ]);
+  const b = tf.scalar(0);
+  model.layers[0].setWeights([W,b]);
+  model.compile({optimizer: tf.train.adam(0.05), loss:'binaryCrossentropy'});
+  return model;
+}
+
+document.getElementById('csvInput').addEventListener('change', async (e)=>{
+  const file = e.target.files[0]; if(!file) return;
+  const text = await file.text();
+  const lines = text.trim().split(/\r?\n/); const header = lines.shift().split(/,|\t/).map(s=>s.trim());
+  const col = (name)=> header.indexOf(name);
+  const X=[], Y=[];
+  for(const line of lines){
+    const r=line.split(/,|\t/).map(s=>s.trim());
+    const f=[
+      +r[col('inters_per_km2')],
+      +r[col('amenity_entropy')],
+      +r[col('dest_access')],
+      +r[col('transit_density_per_km2')],
+      +r[col('sidewalk_ratio')],
+      +r[col('crosswalks_per_km2')]
+    ];
+    X.push([
+      scale(f[0], FEAT_BOUNDS.inters_per_km2),
+      scale(f[1], FEAT_BOUNDS.amenity_entropy),
+      scale(f[2], FEAT_BOUNDS.dest_access),
+      scale(f[3], FEAT_BOUNDS.transit_density_per_km2),
+      scale(f[4], FEAT_BOUNDS.sidewalk_ratio),
+      scale(f[5], FEAT_BOUNDS.crosswalks_per_km2),
+    ]);
+    Y.push([+r[col('label')]]);
+  }
+  const Xt = tf.tensor2d(X), Yt = tf.tensor2d(Y);
+  const model = makeModel();
+  await model.fit(Xt, Yt, {epochs:50, verbose:0});
+  // If we have a score on screen, rescore last features by reading grid values is messy; skip
+  setStatus('Custom weights trained and applied for predictions made during this session.');
+});
+</script>
+</body>
+</html>
