@@ -1,5 +1,5 @@
 
-# Walkability ML — Chromebook‑ready single‑file app
+# Walkability ML
 
 This is a **self‑contained HTML app** that runs entirely in your browser (Chromebook‑friendly). Click any point on the map to:
 - Fetch OpenStreetMap data via Overpass for a ~1km radius
